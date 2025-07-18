@@ -43,12 +43,12 @@ func Load() (*Config, error) {
 		LogLevel:        getEnv("LOG_LEVEL", "info"),
 		Environment:     getEnv("ENV", "development"),
 		DatabasePath:    getEnv("DATABASE_PATH", "data.db"),
-		ShutdownTimeout: getDurationEnv("SHUTDOWN_TIMEOUT", 30*time.Second),
+		ShutdownTimeout: getDurationEnv("SHUTDOWN_TIMEOUT", 10*time.Second),
 		WriteTimeout:    getDurationEnv("WRITE_TIMEOUT", 10*time.Second),
 		ReadTimeout:     getDurationEnv("READ_TIMEOUT", 10*time.Second),
 		PingInterval:    getDurationEnv("PING_INTERVAL", 30*time.Second),
 		PongWait:        getDurationEnv("PONG_WAIT", 60*time.Second),
-		MaxConnections:  getIntEnv("MAX_CONNECTIONS", 1000),
+		MaxConnections:  getIntEnv("MAX_CONNECTIONS", 100),
 		MaxMessageSize:  getInt64Env("MAX_MESSAGE_SIZE", 512*1024), // 512KB default
 		BufferSize:      getIntEnv("BUFFER_SIZE", 256),
 	}

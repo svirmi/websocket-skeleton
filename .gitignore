@@ -1,6 +1,6 @@
-messages.db
-messages.db-shm
-messages.db-wal
+data.db
+data.db-shm
+data.db-wal
 
 
 # If you prefer the allow list template instead of the deny list, see community template:
