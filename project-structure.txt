@@ -1,0 +1,25 @@
+websocket-skeleton/
+├── cmd/
+│   └── server/
+│       └── main.go           # Application entry point
+├── internal/
+│   ├── websocket/
+│   │   ├── client.go        # WebSocket client implementation
+│   │   ├── hub.go          # WebSocket connection hub/manager
+│   │   └── server.go       # WebSocket server implementation
+│   ├── storage/
+│   │   ├── sqlite.go       # SQLite database operations
+│   │   └── models.go       # Data models/structures
+│   ├── processor/
+│   │   ├── processor.go    # Data processing logic
+│   │   └── pipeline.go     # Processing pipeline implementation
+│   └── config/
+│       └── config.go       # Configuration management
+├── pkg/
+│   └── utils/
+│       └── logger.go       # Logging utilities
+├── scripts/
+│   └── schema.sql         # Database schema
+├── .env.example           # Example environment variables
+├── go.mod
+└── README.md
