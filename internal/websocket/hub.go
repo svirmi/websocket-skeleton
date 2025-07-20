@@ -187,6 +187,8 @@ func (h *Hub) SetDraining(draining bool) {
 
 // GetMetrics returns current hub metrics
 func (h *Hub) GetMetrics() *Metrics {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	return &Metrics{
 		ActiveConnections: atomic.LoadInt64(&h.metrics.activeConnections),
 		MessagesProcessed: atomic.LoadInt64(&h.metrics.messagesProcessed),
