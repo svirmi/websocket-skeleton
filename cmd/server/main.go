@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"github.com/svirmi/websocket-skeleton/internal/config"
 	"github.com/svirmi/websocket-skeleton/internal/ingestion"
 	"github.com/svirmi/websocket-skeleton/internal/logger"
+	"github.com/svirmi/websocket-skeleton/internal/models"
 	"github.com/svirmi/websocket-skeleton/internal/processor"
 	"github.com/svirmi/websocket-skeleton/internal/websocket"
 )
@@ -89,16 +91,20 @@ func main() {
 
 	// Connect components
 	go func() {
-		log.Info().Msg("Starting message forwarding from ingestion to pipeline")
+		log.Info().Msg("Starting message monitoring")
 		for msg := range ingestionService.GetOutput() {
-			select {
-			case pipeline.GetInput() <- msg:
-				log.Debug().
-					Int("size", len(msg)).
-					Msg("Forwarded message to pipeline")
-			case <-ctx.Done():
-				return
+			var trade models.ProcessedTrade
+			if err := json.Unmarshal(msg, &trade); err != nil {
+				log.Error().Err(err).Msg("Failed to parse trade message")
+				continue
 			}
+			log.Debug().
+				Str("symbol", trade.Symbol).
+				Float64("price", trade.Price).
+				Float64("size", trade.Size).
+				Str("side", trade.Side).
+				Time("trade_time", trade.TradeTime).
+				Msg("Received trade")
 		}
 	}()
 
@@ -137,6 +143,33 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start ingestion service")
 	}
 	log.Info().Msg("Started ingestion service")
+
+	// Monitor source status
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				status, err := ingestionService.GetSourceStatus("bybit_options")
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get source status")
+					continue
+				}
+				log.Info().
+					Bool("connected", status.Connected).
+					Time("last_message", status.LastMessage).
+					Int64("messages", status.MessagesCount).
+					Int64("bytes", status.BytesReceived).
+					Int64("errors", status.Errors).
+					Str("last_error", status.LastError).
+					Msg("Bybit source status")
+			}
+		}
+	}()
 
 	pipeline.Start(cfg.ProcessingWorkers)
 	log.Info().Msg("Started processing pipeline")

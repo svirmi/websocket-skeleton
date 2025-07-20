@@ -6,25 +6,17 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/rs/zerolog"
-	"github.com/svirmi/websocket-skeleton/internal/logger"
+	"github.com/gorilla/websocket"
 	"github.com/svirmi/websocket-skeleton/internal/models"
 )
-
-var log zerolog.Logger
-
-func init() {
-	log = logger.GetLogger("bybit_source")
-}
 
 type BybitSource struct {
 	*WebSocketSource
 	subscribedSymbols []string
-	logger            zerolog.Logger
 }
 
 func NewBybitSource(id string, symbols []string, bufferSize int, maxMessageSize int64) *BybitSource {
-	bs := &BybitSource{
+	return &BybitSource{
 		WebSocketSource: NewWebSocketSource(
 			id,
 			"wss://stream-testnet.bybit.com/v5/trade/option",
@@ -32,20 +24,79 @@ func NewBybitSource(id string, symbols []string, bufferSize int, maxMessageSize 
 			maxMessageSize,
 		),
 		subscribedSymbols: symbols,
-		logger:            log.With().Str("source_id", id).Logger(),
 	}
-	return bs
 }
 
-func (bs *BybitSource) readPump(ctx context.Context) {
-	bs.logger.Debug().Msg("Starting read pump")
+// Override Start to handle Bybit-specific connection logic
+func (bs *BybitSource) Start(ctx context.Context) error {
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
 
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				bs.disconnect()
+				return
+			default:
+				if err := bs.connectAndSubscribe(&dialer); err != nil {
+					bs.setError(err.Error())
+					time.Sleep(bs.reconnectInterval)
+					continue
+				}
+
+				bs.readPump(ctx)
+			}
+		}
+	}()
+
+	return nil
+}
+
+// New method to handle connection and subscription
+func (bs *BybitSource) connectAndSubscribe(dialer *websocket.Dialer) error {
+	// First connect using the parent's connect logic
+	conn, _, err := dialer.Dial(bs.url, nil)
+	if err != nil {
+		return err
+	}
+
+	bs.mu.Lock()
+	bs.conn = conn
+	bs.mu.Unlock()
+
+	bs.connected.Store(true)
+
+	// Subscribe to trade topics
+	subMsg := models.SubscribeMessage{
+		ReqID: fmt.Sprintf("sub_%d", time.Now().Unix()),
+		Op:    "subscribe",
+		Args:  make([]string, len(bs.subscribedSymbols)),
+	}
+
+	for i, symbol := range bs.subscribedSymbols {
+		subMsg.Args[i] = fmt.Sprintf("trade.%s", symbol)
+	}
+
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+
+	if err := bs.conn.WriteJSON(subMsg); err != nil {
+		bs.disconnect()
+		return fmt.Errorf("subscription failed: %w", err)
+	}
+
+	return nil
+}
+
+// Override readPump to handle Bybit-specific message processing
+func (bs *BybitSource) readPump(ctx context.Context) {
 	bs.mu.RLock()
 	conn := bs.conn
 	bs.mu.RUnlock()
 
 	if conn == nil {
-		bs.logger.Error().Msg("Connection is nil")
 		return
 	}
 
@@ -54,12 +105,10 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			bs.logger.Debug().Msg("Context cancelled, stopping read pump")
 			return
 		default:
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				bs.logger.Error().Err(err).Msg("Read error")
 				bs.setError(err.Error())
 				return
 			}
@@ -67,28 +116,18 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 			// Parse the message
 			var bybitMsg models.BybitMessage
 			if err := json.Unmarshal(message, &bybitMsg); err != nil {
-				bs.logger.Error().Err(err).RawJSON("message", message).Msg("JSON parse error")
 				bs.setError(fmt.Sprintf("JSON parse error: %v", err))
 				continue
 			}
-
-			bs.logger.Debug().
-				Str("topic", bybitMsg.Topic).
-				Str("type", bybitMsg.Type).
-				Int64("timestamp", bybitMsg.Timestamp).
-				Msg("Received message")
 
 			// Handle different message types
 			switch bybitMsg.Type {
 			case "snapshot", "delta":
 				var trades []models.OptionTradeData
 				if err := json.Unmarshal(bybitMsg.Data, &trades); err != nil {
-					bs.logger.Error().Err(err).RawJSON("data", bybitMsg.Data).Msg("Trade data parse error")
 					bs.setError(fmt.Sprintf("Trade data parse error: %v", err))
 					continue
 				}
-
-				bs.logger.Debug().Int("trade_count", len(trades)).Msg("Processing trades")
 
 				for _, trade := range trades {
 					processed := models.ProcessedTrade{
@@ -104,12 +143,11 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 
 					processedJSON, err := json.Marshal(processed)
 					if err != nil {
-						bs.logger.Error().Err(err).Interface("trade", processed).Msg("JSON marshal error")
 						bs.setError(fmt.Sprintf("JSON marshal error: %v", err))
 						continue
 					}
 
-					bs.output <- processedJSON // Fixed: using output instead of Output
+					bs.output <- processedJSON
 				}
 
 				bs.lastMessage.Store(time.Now())
@@ -117,14 +155,23 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 				bs.bytesReceived.Add(int64(len(message)))
 
 			case "error":
-				bs.logger.Error().RawJSON("message", message).Msg("Received error message from Bybit")
 				bs.setError(fmt.Sprintf("Bybit error message: %s", string(message)))
 
 			default:
-				bs.logger.Warn().Str("type", bybitMsg.Type).RawJSON("message", message).Msg("Unknown message type")
+				// Ignore non-trade messages (like pong responses)
+				continue
 			}
 		}
 	}
 }
 
-// ... rest of the methods remain the same ...
+func (bs *BybitSource) Status() SourceStatus {
+	return SourceStatus{
+		Connected:     bs.connected.Load(),
+		LastMessage:   bs.lastMessage.Load().(time.Time),
+		MessagesCount: bs.messagesCount.Load(),
+		BytesReceived: bs.bytesReceived.Load(),
+		Errors:        bs.errorCount.Load(),
+		LastError:     bs.lastError.Load().(string),
+	}
+}
