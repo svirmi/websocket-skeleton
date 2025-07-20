@@ -2,190 +2,90 @@ package websocket
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/svirmi/websocket-skeleton/internal/config"
-	"github.com/svirmi/websocket-skeleton/internal/processor"
+	"github.com/svirmi/websocket-skeleton/internal/logger"
 )
 
-type Server struct {
-	port      string
-	host      string
-	hub       *Hub
-	upgrader  websocket.Upgrader
-	processor *processor.MessageProcessor
-	startTime time.Time
-	config    *config.Config
+var log = logger.GetLogger("websocket_server")
 
-	// Protected server state
-	mu           sync.RWMutex
-	server       *http.Server
-	shuttingDown atomic.Int32
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins in development
+	},
+}
+
+type Server struct {
+	cfg    *config.Config
+	hub    *Hub
+	server *http.Server
 }
 
 func NewServer(cfg *config.Config, hub *Hub) *Server {
-	s := &Server{
-		port: cfg.WSPort,
-		host: cfg.Host,
-		hub:  hub,
-		upgrader: websocket.Upgrader{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Implement proper origin check in production
-				return true
-			},
-		},
-		processor: processor.NewMessageProcessor(cfg.MaxMessageSize),
-		startTime: time.Now(),
-		config:    cfg,
+	return &Server{
+		cfg: cfg,
+		hub: hub,
 	}
-	return s
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	// Create mux and setup routes
 	mux := http.NewServeMux()
+
+	// WebSocket endpoint
 	mux.HandleFunc("/ws", s.handleWebSocket)
+
+	// Health check endpoint
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/metrics", s.handleMetrics)
 
-	addr := fmt.Sprintf("%s%s", s.host, s.port)
-
-	// Create new server instance
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadTimeout:       s.config.ReadTimeout,
-		WriteTimeout:      s.config.WriteTimeout,
-		IdleTimeout:       120 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
+	s.server = &http.Server{
+		Addr:    s.cfg.WSPort,
+		Handler: mux,
 	}
 
-	// Safely store server instance
-	s.mu.Lock()
-	s.server = srv
-	s.mu.Unlock()
+	log.Info().Str("addr", s.cfg.WSPort).Msg("Starting WebSocket server")
 
-	// Channel for server errors
-	serverErr := make(chan error, 1)
+	go s.hub.Run(ctx)
 
-	// Start server in a goroutine
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			serverErr <- fmt.Errorf("server error: %w", err)
-		}
-	}()
-
-	// Wait for context cancellation or server error
-	select {
-	case <-ctx.Done():
-		return s.Shutdown(context.Background())
-	case err := <-serverErr:
+	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
-}
 
-func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	if s.shuttingDown.Load() == 1 {
-		http.Error(w, "Server is shutting down", http.StatusServiceUnavailable)
-		return
-	}
-
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		http.Error(w, "Could not upgrade connection", http.StatusInternalServerError)
-		return
-	}
-
-	client := NewClient(
-		s.hub,
-		conn,
-		s.config.MaxMessageSize,
-		s.processor,
-		s.config.BufferSize,
-	)
-
-	s.hub.register <- client
-
-	go client.WritePump(
-		s.config.WriteTimeout,
-		s.config.PingInterval,
-	)
-	go client.ReadPump(s.config.PongWait)
-}
-
-func (s *Server) Shutdown(ctx context.Context) error {
-	// Mark server as shutting down first
-	s.StartDraining()
-
-	// Get current server instance safely
-	s.mu.RLock()
-	srv := s.server
-	s.mu.RUnlock()
-
-	if srv != nil {
-		return srv.Shutdown(ctx)
-	}
 	return nil
 }
 
-func (s *Server) StartDraining() {
-	// Use atomic operation for shutting down flag
-	if !s.shuttingDown.CompareAndSwap(0, 1) {
-		return // Already shutting down
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to upgrade connection")
+		return
 	}
 
-	s.hub.SetDraining(true)
-
-	// Get current server instance safely
-	s.mu.RLock()
-	srv := s.server
-	s.mu.RUnlock()
-
-	if srv != nil {
-		srv.SetKeepAlivesEnabled(false)
+	client := &Client{
+		hub:  s.hub,
+		conn: conn,
+		send: make(chan []byte, s.cfg.BufferSize),
 	}
+
+	s.hub.register <- client
+
+	go client.writePump()
+	go client.readPump()
+
+	log.Info().
+		Str("remote_addr", conn.RemoteAddr().String()).
+		Msg("New WebSocket connection established")
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	metrics := s.hub.GetMetrics()
-
-	status := "healthy"
-	if s.shuttingDown.Load() == 1 {
-		status = "shutting_down"
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}
-
-	health := struct {
-		Status       string    `json:"status"`
-		Uptime       string    `json:"uptime"`
-		StartTime    time.Time `json:"start_time"`
-		Connections  int64     `json:"connections"`
-		MessageCount int64     `json:"message_count"`
-		Environment  string    `json:"environment"`
-	}{
-		Status:       status,
-		Uptime:       time.Since(s.startTime).String(),
-		StartTime:    s.startTime,
-		Connections:  metrics.ActiveConnections,
-		MessageCount: metrics.MessagesProcessed,
-		Environment:  s.config.Environment,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	metrics := s.hub.GetMetrics()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
+func (s *Server) Shutdown(ctx context.Context) error {
+	log.Info().Msg("Shutting down WebSocket server")
+	return s.server.Shutdown(ctx)
 }

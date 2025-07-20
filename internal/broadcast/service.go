@@ -13,12 +13,30 @@ type Subscriber struct {
 
 type BroadcastService struct {
 	input       chan []byte
+	Output      chan []byte // Make this public
 	subscribers map[string]*Subscriber
 	mu          sync.RWMutex
 	bufferSize  int
 	metrics     *Metrics
 	ctx         context.Context
 	cancel      context.CancelFunc
+}
+
+func NewBroadcastService(bufferSize int) *BroadcastService {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &BroadcastService{
+		input:       make(chan []byte, bufferSize),
+		Output:      make(chan []byte, bufferSize), // Initialize the output channel
+		subscribers: make(map[string]*Subscriber),
+		bufferSize:  bufferSize,
+		metrics:     &Metrics{},
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+}
+
+func (b *BroadcastService) GetOutput() <-chan []byte {
+	return b.Output
 }
 
 type Metrics struct {
@@ -28,18 +46,6 @@ type Metrics struct {
 	DroppedMessages   int64
 	LastBroadcastTime time.Time
 	mu                sync.RWMutex
-}
-
-func NewBroadcastService(bufferSize int) *BroadcastService {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &BroadcastService{
-		input:       make(chan []byte, bufferSize),
-		subscribers: make(map[string]*Subscriber),
-		bufferSize:  bufferSize,
-		metrics:     &Metrics{},
-		ctx:         ctx,
-		cancel:      cancel,
-	}
 }
 
 func (b *BroadcastService) Start() {
