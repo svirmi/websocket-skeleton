@@ -7,49 +7,66 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog"
-	"github.com/svirmi/websocket-skeleton/internal/logger"
 	"github.com/svirmi/websocket-skeleton/internal/models"
 )
 
-// Logger instance for this package
-var log zerolog.Logger
-
-func init() {
-	log = logger.GetLogger("bybit_source")
-}
-
 type BybitSource struct {
-	WebSocketSource
+	*WebSocketSource
 	subscribedSymbols []string
-	logger            zerolog.Logger
 }
 
 func NewBybitSource(id string, symbols []string, bufferSize int, maxMessageSize int64) *BybitSource {
-	bs := &BybitSource{
-		WebSocketSource: *NewWebSocketSource(
+	return &BybitSource{
+		WebSocketSource: NewWebSocketSource(
 			id,
 			"wss://stream-testnet.bybit.com/v5/trade/option",
 			bufferSize,
 			maxMessageSize,
 		),
 		subscribedSymbols: symbols,
-		logger:            log.With().Str("source_id", id).Logger(),
 	}
-	return bs
 }
 
-func (bs *BybitSource) connect(dialer *websocket.Dialer) error {
-	bs.logger.Debug().
-		Str("url", bs.url).
-		Msg("Connecting to Bybit")
+// Override Start to handle Bybit-specific connection logic
+func (bs *BybitSource) Start(ctx context.Context) error {
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
 
-	if err := bs.WebSocketSource.connect(dialer); err != nil {
-		bs.logger.Error().
-			Err(err).
-			Msg("Failed to connect to Bybit")
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				bs.disconnect()
+				return
+			default:
+				if err := bs.connectAndSubscribe(&dialer); err != nil {
+					bs.setError(err.Error())
+					time.Sleep(bs.reconnectInterval)
+					continue
+				}
+
+				bs.readPump(ctx)
+			}
+		}
+	}()
+
+	return nil
+}
+
+// New method to handle connection and subscription
+func (bs *BybitSource) connectAndSubscribe(dialer *websocket.Dialer) error {
+	// First connect using the parent's connect logic
+	conn, _, err := dialer.Dial(bs.url, nil)
+	if err != nil {
 		return err
 	}
+
+	bs.mu.Lock()
+	bs.conn = conn
+	bs.mu.Unlock()
+
+	bs.connected.Store(true)
 
 	// Subscribe to trade topics
 	subMsg := models.SubscribeMessage{
@@ -62,39 +79,24 @@ func (bs *BybitSource) connect(dialer *websocket.Dialer) error {
 		subMsg.Args[i] = fmt.Sprintf("trade.%s", symbol)
 	}
 
-	bs.logger.Debug().
-		Interface("subscription", subMsg).
-		Msg("Subscribing to topics")
-
 	bs.mu.RLock()
-	conn := bs.conn
-	bs.mu.RUnlock()
+	defer bs.mu.RUnlock()
 
-	if err := conn.WriteJSON(subMsg); err != nil {
-		bs.logger.Error().
-			Err(err).
-			Interface("subscription", subMsg).
-			Msg("Subscription failed")
+	if err := bs.conn.WriteJSON(subMsg); err != nil {
 		bs.disconnect()
 		return fmt.Errorf("subscription failed: %w", err)
 	}
 
-	bs.logger.Info().
-		Strs("symbols", bs.subscribedSymbols).
-		Msg("Successfully connected and subscribed")
-
 	return nil
 }
 
+// Override readPump to handle Bybit-specific message processing
 func (bs *BybitSource) readPump(ctx context.Context) {
-	bs.logger.Debug().Msg("Starting read pump")
-
 	bs.mu.RLock()
 	conn := bs.conn
 	bs.mu.RUnlock()
 
 	if conn == nil {
-		bs.logger.Error().Msg("Connection is nil")
 		return
 	}
 
@@ -103,14 +105,10 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			bs.logger.Debug().Msg("Context cancelled, stopping read pump")
 			return
 		default:
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				bs.logger.Error().
-					Err(err).
-					Msg("Read error")
 				bs.setError(err.Error())
 				return
 			}
@@ -118,39 +116,19 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 			// Parse the message
 			var bybitMsg models.BybitMessage
 			if err := json.Unmarshal(message, &bybitMsg); err != nil {
-				bs.logger.Error().
-					Err(err).
-					RawJSON("message", message).
-					Msg("JSON parse error")
 				bs.setError(fmt.Sprintf("JSON parse error: %v", err))
 				continue
 			}
 
-			bs.logger.Debug().
-				Str("topic", bybitMsg.Topic).
-				Str("type", bybitMsg.Type).
-				Int64("timestamp", bybitMsg.Timestamp).
-				Msg("Received message")
-
 			// Handle different message types
 			switch bybitMsg.Type {
 			case "snapshot", "delta":
-				// Process trade data
 				var trades []models.OptionTradeData
 				if err := json.Unmarshal(bybitMsg.Data, &trades); err != nil {
-					bs.logger.Error().
-						Err(err).
-						RawJSON("data", bybitMsg.Data).
-						Msg("Trade data parse error")
 					bs.setError(fmt.Sprintf("Trade data parse error: %v", err))
 					continue
 				}
 
-				bs.logger.Debug().
-					Int("trade_count", len(trades)).
-					Msg("Processing trades")
-
-				// Process each trade
 				for _, trade := range trades {
 					processed := models.ProcessedTrade{
 						Symbol:        trade.Symbol,
@@ -163,13 +141,8 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 						Source:        "bybit",
 					}
 
-					// Convert to JSON
 					processedJSON, err := json.Marshal(processed)
 					if err != nil {
-						bs.logger.Error().
-							Err(err).
-							Interface("trade", processed).
-							Msg("JSON marshal error")
 						bs.setError(fmt.Sprintf("JSON marshal error: %v", err))
 						continue
 					}
@@ -182,36 +155,23 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 				bs.bytesReceived.Add(int64(len(message)))
 
 			case "error":
-				bs.logger.Error().
-					RawJSON("message", message).
-					Msg("Received error message from Bybit")
 				bs.setError(fmt.Sprintf("Bybit error message: %s", string(message)))
 
 			default:
-				bs.logger.Warn().
-					Str("type", bybitMsg.Type).
-					RawJSON("message", message).
-					Msg("Unknown message type")
+				// Ignore non-trade messages (like pong responses)
+				continue
 			}
 		}
 	}
 }
 
-func (bs *BybitSource) disconnect() {
-	bs.logger.Debug().Msg("Disconnecting from Bybit")
-	bs.mu.Lock()
-	if bs.conn != nil {
-		bs.conn.Close()
-		bs.conn = nil
+func (bs *BybitSource) Status() SourceStatus {
+	return SourceStatus{
+		Connected:     bs.connected.Load(),
+		LastMessage:   bs.lastMessage.Load().(time.Time),
+		MessagesCount: bs.messagesCount.Load(),
+		BytesReceived: bs.bytesReceived.Load(),
+		Errors:        bs.errorCount.Load(),
+		LastError:     bs.lastError.Load().(string),
 	}
-	bs.mu.Unlock()
-
-	bs.connected.Store(false)
-	bs.setError("disconnected")
-}
-
-func (bs *BybitSource) setError(err string) {
-	bs.logger.Error().Str("error", err).Msg("Source error occurred")
-	bs.lastError.Store(err)
-	bs.errorCount.Add(1)
 }

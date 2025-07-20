@@ -14,6 +14,13 @@ type BybitMessage struct {
 	ServerTime int64           `json:"serverTime,omitempty"`
 }
 
+// SubscribeMessage represents the subscription request to Bybit WebSocket
+type SubscribeMessage struct {
+	ReqID string   `json:"req_id"`
+	Op    string   `json:"op"`
+	Args  []string `json:"args"`
+}
+
 // OptionTradeData represents the trade data for options
 type OptionTradeData struct {
 	Symbol        string  `json:"symbol"`
@@ -24,13 +31,6 @@ type OptionTradeData struct {
 	Side          string  `json:"side"`
 	BlockTrade    bool    `json:"blockTrade"`
 	IV            float64 `json:"iv,string"`
-}
-
-// SubscribeMessage represents the subscription message to send to Bybit
-type SubscribeMessage struct {
-	ReqID string   `json:"req_id"`
-	Op    string   `json:"op"`
-	Args  []string `json:"args"`
 }
 
 // ProcessedTrade represents our enriched trade data

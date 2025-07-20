@@ -41,7 +41,6 @@ type WebSocketSource struct {
 	errorCount    atomic.Int64
 
 	// Protected fields
-	statusMu    sync.RWMutex
 	connected   atomic.Bool
 	lastMessage atomic.Value // stores time.Time
 	lastError   atomic.Value // stores string
