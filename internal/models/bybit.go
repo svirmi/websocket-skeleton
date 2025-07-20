@@ -7,11 +7,11 @@ import (
 
 // BybitMessage represents the wrapper message structure from Bybit
 type BybitMessage struct {
-	Topic      string          `json:"topic"`
-	Type       string          `json:"type"`
-	Data       json.RawMessage `json:"data"`
-	Timestamp  int64           `json:"ts"`
-	ServerTime int64           `json:"serverTime,omitempty"`
+	Topic       string          `json:"topic"`
+	MessageType string          `json:"type"`
+	Data        json.RawMessage `json:"data"`
+	Timestamp   int64           `json:"ts"`
+	ServerTime  int64           `json:"serverTime,omitempty"`
 }
 
 // SubscribeMessage represents the subscription request to Bybit WebSocket
@@ -30,7 +30,7 @@ type OptionTradeData struct {
 	TradeTime     int64   `json:"tradeTime"`
 	Side          string  `json:"side"`
 	BlockTrade    bool    `json:"blockTrade"`
-	IV            float64 `json:"iv,string"`
+	ImpliedVol    float64 `json:"iv,string"`
 }
 
 // ProcessedTrade represents our enriched trade data
@@ -39,7 +39,7 @@ type ProcessedTrade struct {
 	Price         float64   `json:"price"`
 	Size          float64   `json:"size"`
 	Side          string    `json:"side"`
-	IV            float64   `json:"iv"`
+	ImpliedVol    float64   `json:"implied_vol"`
 	TradeTime     time.Time `json:"trade_time"`
 	ProcessedTime time.Time `json:"processed_time"`
 	Source        string    `json:"source"`

@@ -50,12 +50,12 @@ func main() {
 	ingestionService := ingestion.NewDataIngestionService(cfg.BufferSize)
 
 	// Create Bybit source
-	bybitSource := ingestion.NewBybitSource(
-		"bybit_options",
-		cfg.BybitSymbols,
-		cfg.BufferSize,
-		cfg.MaxMessageSize,
-	)
+	symbols := []string{
+		"BTCUSDT-1AUG25-119000-P",
+		"ETHUSDT-25JUL25-3750-C",
+	}
+
+	bybitSource := ingestion.NewBybitSource("bybit_options", symbols, 1000, 1048576)
 
 	// Add source to ingestion service
 	if err := ingestionService.AddSource(bybitSource); err != nil {
@@ -100,8 +100,8 @@ func main() {
 			}
 			log.Debug().
 				Str("symbol", trade.Symbol).
-				Float64("price", trade.Price).
-				Float64("size", trade.Size).
+				Str("price", trade.Price).
+				Str("size", trade.Size).
 				Str("side", trade.Side).
 				Time("trade_time", trade.TradeTime).
 				Msg("Received trade")

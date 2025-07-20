@@ -10,24 +10,48 @@ import (
 	"github.com/svirmi/websocket-skeleton/internal/models"
 )
 
-type BybitSource struct {
-	*WebSocketSource
-	subscribedSymbols []string
+type BybitConfig struct {
+	BaseCoins    []string            // Base coins to subscribe (BTC, ETH, SOL)
+	Expiry       string              // Expiry date in format like "27JUL25"
+	TestNet      bool                // Whether to use testnet
+	StrikeRanges map[string][]string // Strike prices for each base coin
 }
 
-func NewBybitSource(id string, symbols []string, bufferSize int, maxMessageSize int64) *BybitSource {
-	return &BybitSource{
-		WebSocketSource: NewWebSocketSource(
-			id,
-			"wss://stream-testnet.bybit.com/v5/trade/option",
-			bufferSize,
-			maxMessageSize,
-		),
-		subscribedSymbols: symbols,
+func DefaultBybitConfig() BybitConfig {
+	return BybitConfig{
+		BaseCoins: []string{"BTC", "ETH", "SOL"},
+		Expiry:    "27JUL25",
+		TestNet:   true,
+		StrikeRanges: map[string][]string{
+			"BTC": {"60000", "65000"},
+			"ETH": {"2000", "2500"},
+			"SOL": {"100", "120"},
+		},
 	}
 }
 
-// Override Start to handle Bybit-specific connection logic
+type BybitSource struct {
+	*WebSocketSource
+	config BybitConfig
+}
+
+func NewBybitSource(id string, config BybitConfig, bufferSize int, maxMessageSize int64) *BybitSource {
+	wsURL := "wss://stream-testnet.bybit.com/v5/trade/option"
+	if !config.TestNet {
+		wsURL = "wss://stream.bybit.com/v5/trade/option"
+	}
+
+	return &BybitSource{
+		WebSocketSource: NewWebSocketSource(
+			id,
+			wsURL,
+			bufferSize,
+			maxMessageSize,
+		),
+		config: config,
+	}
+}
+
 func (bs *BybitSource) Start(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
@@ -37,11 +61,11 @@ func (bs *BybitSource) Start(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				bs.disconnect()
+				bs.Close()
 				return
 			default:
 				if err := bs.connectAndSubscribe(&dialer); err != nil {
-					bs.setError(err.Error())
+					bs.updateError(err.Error())
 					time.Sleep(bs.reconnectInterval)
 					continue
 				}
@@ -54,9 +78,8 @@ func (bs *BybitSource) Start(ctx context.Context) error {
 	return nil
 }
 
-// New method to handle connection and subscription
 func (bs *BybitSource) connectAndSubscribe(dialer *websocket.Dialer) error {
-	// First connect using the parent's connect logic
+	// First connect
 	conn, _, err := dialer.Dial(bs.url, nil)
 	if err != nil {
 		return err
@@ -68,29 +91,38 @@ func (bs *BybitSource) connectAndSubscribe(dialer *websocket.Dialer) error {
 
 	bs.connected.Store(true)
 
-	// Subscribe to trade topics
-	subMsg := models.SubscribeMessage{
-		ReqID: fmt.Sprintf("sub_%d", time.Now().Unix()),
-		Op:    "subscribe",
-		Args:  make([]string, len(bs.subscribedSymbols)),
+	// Generate subscription message
+	var subscriptionTopics []string
+	for _, baseCoin := range bs.config.BaseCoins {
+		if strikes, ok := bs.config.StrikeRanges[baseCoin]; ok {
+			for _, strike := range strikes {
+				// Subscribe to both calls and puts
+				subscriptionTopics = append(subscriptionTopics,
+					fmt.Sprintf("trade.%s-%s-%s-C", baseCoin, bs.config.Expiry, strike),
+					fmt.Sprintf("trade.%s-%s-%s-P", baseCoin, bs.config.Expiry, strike),
+				)
+			}
+		}
 	}
 
-	for i, symbol := range bs.subscribedSymbols {
-		subMsg.Args[i] = fmt.Sprintf("trade.%s", symbol)
+	// Create subscription message
+	subMsg := models.SubscribeMessage{
+		ReqID: fmt.Sprintf("svirmi_%d", time.Now().Unix()),
+		Op:    "subscribe",
+		Args:  subscriptionTopics,
 	}
 
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 
 	if err := bs.conn.WriteJSON(subMsg); err != nil {
-		bs.disconnect()
+		bs.Close()
 		return fmt.Errorf("subscription failed: %w", err)
 	}
 
 	return nil
 }
 
-// Override readPump to handle Bybit-specific message processing
 func (bs *BybitSource) readPump(ctx context.Context) {
 	bs.mu.RLock()
 	conn := bs.conn
@@ -109,23 +141,23 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 		default:
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				bs.setError(err.Error())
+				bs.updateError(err.Error())
 				return
 			}
 
 			// Parse the message
 			var bybitMsg models.BybitMessage
 			if err := json.Unmarshal(message, &bybitMsg); err != nil {
-				bs.setError(fmt.Sprintf("JSON parse error: %v", err))
+				bs.updateError(fmt.Sprintf("JSON parse error: %v", err))
 				continue
 			}
 
 			// Handle different message types
-			switch bybitMsg.Type {
+			switch bybitMsg.MessageType {
 			case "snapshot", "delta":
 				var trades []models.OptionTradeData
 				if err := json.Unmarshal(bybitMsg.Data, &trades); err != nil {
-					bs.setError(fmt.Sprintf("Trade data parse error: %v", err))
+					bs.updateError(fmt.Sprintf("Trade data parse error: %v", err))
 					continue
 				}
 
@@ -135,7 +167,7 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 						Price:         trade.Price,
 						Size:          trade.Size,
 						Side:          trade.Side,
-						IV:            trade.IV,
+						ImpliedVol:    trade.ImpliedVol,
 						TradeTime:     time.Unix(0, trade.TradeTime*int64(time.Millisecond)),
 						ProcessedTime: time.Now().UTC(),
 						Source:        "bybit",
@@ -143,7 +175,7 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 
 					processedJSON, err := json.Marshal(processed)
 					if err != nil {
-						bs.setError(fmt.Sprintf("JSON marshal error: %v", err))
+						bs.updateError(fmt.Sprintf("JSON marshal error: %v", err))
 						continue
 					}
 
@@ -155,23 +187,12 @@ func (bs *BybitSource) readPump(ctx context.Context) {
 				bs.bytesReceived.Add(int64(len(message)))
 
 			case "error":
-				bs.setError(fmt.Sprintf("Bybit error message: %s", string(message)))
+				bs.updateError(fmt.Sprintf("Bybit error message: %s", string(message)))
 
 			default:
 				// Ignore non-trade messages (like pong responses)
 				continue
 			}
 		}
-	}
-}
-
-func (bs *BybitSource) Status() SourceStatus {
-	return SourceStatus{
-		Connected:     bs.connected.Load(),
-		LastMessage:   bs.lastMessage.Load().(time.Time),
-		MessagesCount: bs.messagesCount.Load(),
-		BytesReceived: bs.bytesReceived.Load(),
-		Errors:        bs.errorCount.Load(),
-		LastError:     bs.lastError.Load().(string),
 	}
 }

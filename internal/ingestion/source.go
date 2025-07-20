@@ -130,17 +130,17 @@ func (ws *WebSocketSource) readPump(ctx context.Context) {
 	}
 }
 
-func (ws *WebSocketSource) disconnect() {
-	ws.mu.Lock()
-	if ws.conn != nil {
-		ws.conn.Close()
-		ws.conn = nil
-	}
-	ws.mu.Unlock()
+// func (ws *WebSocketSource) disconnect() {
+// 	ws.mu.Lock()
+// 	if ws.conn != nil {
+// 		ws.conn.Close()
+// 		ws.conn = nil
+// 	}
+// 	ws.mu.Unlock()
 
-	ws.connected.Store(false)
-	ws.setError("disconnected")
-}
+// 	ws.connected.Store(false)
+// 	ws.setError("disconnected")
+// }
 
 func (ws *WebSocketSource) Stop() error {
 	ws.disconnect()
@@ -156,10 +156,10 @@ func (ws *WebSocketSource) ID() string {
 	return ws.id
 }
 
-func (ws *WebSocketSource) setError(err string) {
-	ws.lastError.Store(err)
-	ws.errorCount.Add(1)
-}
+// func (ws *WebSocketSource) setError(err string) {
+// 	ws.lastError.Store(err)
+// 	ws.errorCount.Add(1)
+// }
 
 func (ws *WebSocketSource) Status() SourceStatus {
 	return SourceStatus{

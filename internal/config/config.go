@@ -32,6 +32,20 @@ type Config struct {
 	BybitReconnectInterval time.Duration
 }
 
+type BybitConfig struct {
+	BaseCoins []string `json:"base_coins"`
+	Expiry    string   `json:"expiry"`
+	TestNet   bool     `json:"testnet"`
+}
+
+func DefaultBybitConfig() BybitConfig {
+	return BybitConfig{
+		BaseCoins: []string{"BTC", "ETH", "SOL"},
+		Expiry:    "27JUL25", // Should be dynamically set based on current date
+		TestNet:   true,
+	}
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
 		// Server defaults
